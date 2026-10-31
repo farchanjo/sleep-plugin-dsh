@@ -1,0 +1,49 @@
+{
+  "name": "sleep-plugin-dsh",
+  "version": "0.1.0",
+  "description": "Native sleep and timeout waits for DSH: the turn yields and the same session is woken when the timer fires.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "sleep",
+    "timeout",
+    "timer",
+    "cordis"
+  ],
+  "author": "Fabricio Archanjo <farchanjo@gmail.com>",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./parse": "./lib/parse.js"
+  },
+  "files": [
+    "lib",
+    "dsh-plugin.json",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "biome.json"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "lint": "biome check lib test",
+    "lint:fix": "biome check --write lib test"
+  },
+  "engines": {
+    "node": "^22.19 || >=24"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.4"
+  }
+}

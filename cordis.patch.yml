@@ -1,0 +1,14 @@
+# Bundle patch: insert the plugin as a profile row.
+#
+# Every key is optional. The row config is read once at load; invalid values
+# fail the mount instead of silently degrading.
+- insert:
+    - id: sleep-plugin-dsh
+      name: 'sleep-plugin-dsh'
+      config:
+        yieldByDefault: true
+        goalMode: block
+        interceptShell: true
+        wakeOnInput: true
+        maxMs: 604800000
+        maxPendingPerAgent: 8

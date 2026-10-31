@@ -9,6 +9,7 @@
         yieldByDefault: true
         goalMode: block
         interceptShell: true
+        denyShellWaits: true
         wakeOnInput: true
         maxMs: 604800000
         maxPendingPerAgent: 8

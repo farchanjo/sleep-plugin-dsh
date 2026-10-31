@@ -240,7 +240,157 @@ test('a pure bash sleep is replaced and yields', async () => {
   assert.equal(a.delivered[0][0], 'followup');
 });
 
-test('shell forms outside the exact grammar fall back', async () => {
+/**
+ * Run the `tools/pre-execute` waterfall the way the registry composes it.
+ * @param h - harness.
+ * @param exec - pending execution.
+ * @returns the decision and how often the chain reached its end.
+ */
+async function preExecute(h, exec) {
+  const listeners = h.handlers.get('tools/pre-execute') ?? [];
+  let allowed = 0;
+  const step = (index) => {
+    if (index >= listeners.length) {
+      allowed += 1;
+      return Promise.resolve({ kind: 'allow' });
+    }
+    return Promise.resolve(listeners[index](exec, () => step(index + 1)));
+  };
+  const decision = await step(0);
+  return { decision, allowed };
+}
+
+test('the gate denies shell waits the wrapper cannot replace', async () => {
+  const cases = [
+    [{ command: 'sleep 5 && echo ok' }, /shell `sleep` is blocked/],
+    [{ command: 'for i in 1 2; do curl x; sleep 2; done' }, /shell `sleep` is blocked/],
+    [{ command: 'timeout 10 curl x' }, /shell `timeout` is blocked.*timeoutMs/],
+    [{ command: 'timeout 5 x; sleep 1' }, /`sleep` is blocked.*Also, shell `timeout` is blocked/],
+    [{ command: 'sleep 5', run_in_background: true }, /`sleep` tool/],
+    [{ command: 'sleep 5', sandbox_permissions: 'danger-full-access' }, /`sleep` tool/],
+    [{ command: 'sleep 5', timeoutMs: 1000 }, /`sleep` tool/],
+    [{ command: 'sleep 999999999' }, /`sleep` tool/],
+  ];
+  for (const [args, reason] of cases) {
+    const { h } = boot();
+    const a = agentOf('a');
+    h.agents.set('a', a);
+
+    const { decision, allowed } = await preExecute(h, execOf(a, args));
+
+    assert.equal(allowed, 0, JSON.stringify(args));
+    assert.equal(decision.kind, 'deny');
+    assert.match(decision.reason, reason);
+    assert.deepEqual(decision.info, { name: 'ShellWaitDenied', code: 'SHELL_WAIT_DENIED' });
+    cleanup();
+    cleanup = undefined;
+  }
+});
+
+test('the gate allows replaceable waits and commands without waits', async () => {
+  const cases = [
+    { command: 'sleep 5' },
+    { command: 'timeout 10 sleep 60' },
+    { command: 'grep -rn sleep lib/' },
+    { command: 'echo "timeout 5"' },
+    { command: 'npm test', timeoutMs: 60_000 },
+  ];
+  for (const args of cases) {
+    const { h } = boot();
+    const a = agentOf('a');
+    h.agents.set('a', a);
+
+    const { decision, allowed } = await preExecute(h, execOf(a, args));
+
+    assert.equal(allowed, 1, JSON.stringify(args));
+    assert.equal(decision.kind, 'allow');
+    cleanup();
+    cleanup = undefined;
+  }
+});
+
+test('the gate denies a pure wait the wrapper would not replace', async () => {
+  const variants = [
+    [{ interceptShell: false }, {}],
+    [{}, { schema: WRONG_SCHEMA }],
+    [{}, { noBash: true }],
+  ];
+  for (const [config, options] of variants) {
+    const { h } = boot(config, options);
+    const a = agentOf('a');
+    h.agents.set('a', a);
+
+    const { decision } = await preExecute(h, execOf(a, { command: 'sleep 5' }));
+
+    assert.equal(decision.kind, 'deny', JSON.stringify({ config, options }));
+    cleanup();
+    cleanup = undefined;
+  }
+});
+
+test('the gate ignores other tools, missing agents, and denyShellWaits false', async () => {
+  const { h } = boot();
+  const a = agentOf('a');
+  h.agents.set('a', a);
+
+  const other = await preExecute(h, { ...execOf(a, { command: 'sleep 5 && x' }), name: 'pwsh' });
+  assert.equal(other.decision.kind, 'allow');
+  const orphan = await preExecute(h, { ...execOf(a, { command: 'sleep 5 && x' }), agent: undefined });
+  assert.equal(orphan.decision.kind, 'allow');
+  cleanup();
+  cleanup = undefined;
+
+  const off = boot({ denyShellWaits: false });
+  const b = agentOf('b');
+  off.h.agents.set('b', b);
+  const allowed = await preExecute(off.h, execOf(b, { command: 'sleep 5 && echo ok' }));
+  assert.equal(allowed.decision.kind, 'allow');
+  assert.doesNotMatch(off.h.sections.at(-1).text, /denied/);
+});
+
+test('a denying gate tells the model in the prompt section', () => {
+  const { h } = boot();
+  assert.match(h.sections.at(-1).text, /Never run `sleep` or `timeout` in bash/);
+  assert.match(h.sections.at(-1).text, /timeoutMs/);
+});
+
+test('a pure wait over the pending cap fails instead of reaching the shell', async () => {
+  const { h, handler } = boot({ maxPendingPerAgent: 1 });
+  const a = agentOf('a');
+  h.agents.set('a', a);
+  await handler(execOf(a, { command: 'sleep 5' }), shellNext());
+
+  const next = shellNext();
+  const result = await handler(execOf(a, { command: 'sleep 5' }), next);
+
+  assert.equal(next.calls, 0);
+  assert.equal(result.isError, true);
+  assert.equal(result.error.info.code, 'SHELL_WAIT_DENIED');
+  assert.match(result.content[0].text, /^Error: sleep-plugin-dsh: the native wait could not start/);
+});
+
+test('without the deny policy a pure wait over the cap reaches the shell', async () => {
+  const { h, handler } = boot({ maxPendingPerAgent: 1, denyShellWaits: false });
+  const a = agentOf('a');
+  h.agents.set('a', a);
+  await handler(execOf(a, { command: 'sleep 5' }), shellNext());
+
+  const next = shellNext();
+  const result = await handler(execOf(a, { command: 'sleep 5' }), next);
+
+  assert.equal(next.calls, 1);
+  assert.deepEqual(result.value, { shell: true });
+});
+
+test('cleanup removes the gate', () => {
+  const { h } = boot();
+  const before = h.handlers.get('tools/pre-execute').length;
+  cleanup();
+  cleanup = undefined;
+  assert.equal(h.handlers.get('tools/pre-execute').length, before - 2);
+});
+
+test('the dispatch wrapper leaves forms outside the exact grammar to the next stage', async () => {
   const cases = [
     { command: 'sleep 5 && echo ok' },
     { command: 'timeout 10 curl x' },

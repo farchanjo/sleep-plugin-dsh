@@ -13,7 +13,8 @@ Plugin-only. No dsh change, no fork, no edit to another plugin.
 | `sleep_list()` | Lists the calling Agent's pending waits and remaining time. |
 | `sleep_cancel(id?)` | Cancels one wait by id, or every wait of the calling Agent. |
 | `/sleep` | UI command: lists or cancels waits of the receiving session without a model call. |
-| `bash sleep ...` | Intercepted and replaced by the native wait when the command is a pure wait. |
+| `bash sleep ...` | Replaced by the native wait when the command is a pure wait. |
+| any other bash `sleep` / `timeout` | Denied before the shell starts, with a pointer to the native tools. |
 
 The wake is a plugin-sourced user message. It carries the wait id, the elapsed time, and the optional reason. `sleep` always uses a waking follow-up; `timeout` uses next-step context while running and a waking follow-up when idle. A woken turn continues the paused task with its history intact.
 
@@ -33,7 +34,8 @@ This plugin gives waits a native timer and a lifecycle:
 - the turn is idle while waiting, not held by a tool call;
 - the wake targets the exact Agent, including delegated children;
 - an armed goal blocks the yield instead of burning an automatic round;
-- a pure shell wait is routed to the same native path when the plugin is loaded.
+- a pure shell wait is routed to the same native path when the plugin is loaded;
+- every other shell `sleep` or `timeout` is denied, so the shell never holds a wait.
 
 ## Install
 
@@ -60,6 +62,7 @@ The plugin uses public runtime extension points only:
 | Point | Use |
 |---|---|
 | `ctx.tools.register` | The four tools. |
+| `ctx.on('tools/pre-execute', ...)` | Shell wait gate: a `deny` decision for bash calls that run `sleep` or `timeout`. |
 | `ctx.on('tools/execute', ...)` | Fail-open shell interception, registered by this plugin. |
 | `ctx.tools.get('bash', agent)` | Reads the live bash definition. The bash plugin is never mutated. |
 | `validateJsonSchemaValue` | Validates the synthetic bash result before dispatch. |
@@ -69,7 +72,7 @@ The plugin uses public runtime extension points only:
 | `ctx.commands.register` | `/sleep`. |
 | `ctx.systemPrompt.section` | Model guidance. |
 
-Unloading the plugin removes the wrapper, the tools, the command, the prompt section, every timer, and every keepalive.
+Unloading the plugin removes the gate, the wrapper, the tools, the command, the prompt section, every timer, and every keepalive.
 
 ## Yield semantics
 
@@ -152,9 +155,12 @@ A waking message can end the keepalive early. With `wakeOnInput: true`, an inser
 
 The early wake does not cancel the wait. The model or the user cancels it with `sleep_cancel` when it no longer matters.
 
-## Shell interception
+## Shell waits
 
-The wrapper runs on `tools/execute` and replaces a pure `bash sleep` before the shell starts.
+While the plugin is loaded, the shell never holds a wait. Two listeners enforce it:
+
+1. The gate runs on `tools/pre-execute`. It lets a pure wait through to the wrapper and denies every other bash call that would run `sleep` or `timeout`.
+2. The wrapper runs on `tools/execute` and replaces the pure wait with the native timer before the shell starts.
 
 ### Accepted and replaced
 
@@ -168,21 +174,58 @@ The wrapper runs on `tools/execute` and replaces a pure `bash sleep` before the 
 | `timeout 10 sleep 60` | Native 10 s sleep, reported as a timeout hit with exit 124. |
 | `timeout 10 sleep 5` | Native 5 s sleep, exit 0. |
 
-### Left to the shell
+### Denied
+
+A bash call that runs `sleep` or `timeout` and is not replaced gets a policy denial. The model sees `Error: sleep-plugin-dsh: ...` and the error identity `ShellWaitDenied` / `SHELL_WAIT_DENIED`. The text names the native replacement:
+
+| Shell form | Replacement named in the denial |
+|---|---|
+| `sleep` anywhere in the command | The `sleep` tool. To poll, one check per bash call with a `sleep` tool call between checks, or `run_in_background: true` and the job notice. |
+| `timeout N cmd` | The bash `timeoutMs` argument bounds the command; the `timeout` tool is the watchdog. |
+
+Examples of denied calls:
+
+| Command | Why it is not replaced |
+|---|---|
+| `sleep 5 && echo ok` | More than one command. |
+| `for i in 1 2 3; do check; sleep 5; done` | A polling loop. |
+| `server & sleep 12; curl ...` | A wait inside a list. |
+| `timeout 25 git ls-remote origin` | The wrapped command needs a shell. |
+| `bash -c 'sleep 5'`, `ssh host 'sleep 25; docker ps'` | A nested or remote script waits. |
+| `sleep infinity`, `sleep 0`, `timeout -k 5 10 sleep 20` | Outside the strict grammar. |
+| `sleep 5` with `run_in_background: true` | The job would hold the wait. |
+| `sleep 5` with `sandbox_permissions` | No escalation is needed to wait. |
+| `sleep 5` with a `timeoutMs` shorter than the wait | The bash deadline would win. |
+| `sleep 5` while `interceptShell` is false or the bash contract changed | The wrapper cannot replace it. |
+
+A pure wait the gate let through can still fail to start, for example over `maxPendingPerAgent`. The wrapper then returns the same error identity instead of handing the wait to the shell.
+
+### Allowed
+
+The gate denies a name only where the shell would run it. `sleep` and `timeout` as data stay allowed:
 
 | Command | Reason |
 |---|---|
-| `sleep 5 && echo ok` | More than one command. |
-| `sleep 5 \| cat` | A pipeline. |
-| `sleep 0` | The parser requires a positive duration. |
-| `sleep infinity` | No finite timer. |
-| `timeout 10 curl ...` | The wrapped command still needs a shell. |
-| `timeout -k 5 10 sleep 20` | Flags are not parsed. |
-| `run_in_background: true` | The job system owns that lifetime. |
-| `sandbox_permissions` present | The bash body owns the approval path. |
-| `timeoutMs` shorter than the wait | The bash deadline would win. |
-| `pwsh` | Out of scope in this version. |
-| no calling Agent | No owner to wake. |
+| `grep -rn sleep lib/`, `man timeout`, `./run --timeout 5` | An argument. |
+| `echo "sleep 5"`, `git commit -m 'fix sleep'` | A quoted string. |
+| `cat > f.sh <<'EOF'` with `sleep 5` in the body | Heredoc text written to a file. |
+| `timeout=5 ./run`, `for sleep in a b` | A variable name. |
+| `docker run img sleep infinity`, `kubectl exec p -- sleep 5` | A container process. |
+| any `pwsh` call, a call without an Agent | Out of scope. |
+
+### Detection
+
+`lib/scan.js` splits the command the way bash does:
+
+- quotes, escapes, `$'...'`, comments, and line continuations;
+- control operators, pipelines, subshells, brace groups, and `if`/`while`/`until`/`for`/`case` bodies;
+- redirections, including `2>/dev/null` before the command name;
+- command substitution `$(...)` and backticks, process substitution `<(...)`, also inside double quotes and unquoted heredocs;
+- assignments before the command, absolute paths (`/usr/bin/sleep`), and quoted names (`'sleep'`, `\sleep`);
+- wrappers: `env`, `command`, `builtin`, `exec`, `nohup`, `nice`, `ionice`, `setsid`, `stdbuf`, `time`, `sudo`, `doas`, `chrt`, `taskset`, `flock`, `xargs`, `busybox`, `unbuffer`, `caffeinate`, and `timeout` itself;
+- nested scripts: `sh`/`bash`/`zsh`/... `-c`, `eval`, a shell fed by a heredoc, a here-string, or a pipe from `echo`/`printf`/a heredoc, and the remote command of `ssh`.
+
+`gsleep` and `gtimeout` count as `sleep` and `timeout`.
 
 ### Fail-open steps
 
@@ -202,6 +245,8 @@ The wrapper is deduplicated per execution with a `WeakMap`, so a retrying outer 
 
 A wrapper registered before this one can skip `next()` and bypass the interception. The shell then runs normally.
 
+The gate is fail-open too: a throw in the scanner or the schema lookup logs a warning and allows the call. A plugin bug never blocks an unrelated bash command.
+
 ## Configuration
 
 The row config is read once at mount. Invalid values fail the mount.
@@ -211,6 +256,7 @@ The row config is read once at mount. Invalid values fail the mount.
 | `yieldByDefault` | `true` | `false` makes every `sleep` block in the tool call, intercepted shell sleeps included. |
 | `goalMode` | `"block"` | `"block"` blocks on an armed goal; `"yield"` ignores goals. |
 | `interceptShell` | `true` | Master switch for the shell wrapper. |
+| `denyShellWaits` | `true` | Deny bash calls that run `sleep` or `timeout` and are not replaced. Also switches the prompt section to the deny wording. |
 | `wakeOnInput` | `true` | A next-turn message ends the keepalive early. |
 | `maxMs` | `604800000` | Longest accepted wait, 7 days. Capped at Node's `2147483647`. |
 | `maxPendingPerAgent` | `8` | Pending waits per Agent before `sleep`/`timeout` fails. Capped at 128. |
@@ -223,6 +269,7 @@ The bundle patch inserts the row with the defaults. No config is needed. Overrid
     yieldByDefault: true
     goalMode: block
     interceptShell: true
+    denyShellWaits: true
     wakeOnInput: true
     maxMs: 604800000
     maxPendingPerAgent: 8
@@ -234,9 +281,10 @@ Kill switch:
 - id: sleep-plugin-dsh
   config:
     interceptShell: false
+    denyShellWaits: false
 ```
 
-The tools and `/sleep` keep working; `bash sleep` returns to the shell.
+The tools and `/sleep` keep working; `bash sleep` and `bash timeout` return to the shell. With only `interceptShell: false`, a pure `bash sleep` is denied instead of replaced.
 
 ## Contexts
 
@@ -266,8 +314,10 @@ An upgrade can remove a capability; it does not turn the plugin into a hard fail
 - **In memory.** Timers and keepalives die with the process. A restart loses pending waits. There is no durable store or re-arm.
 - **Watchdog only.** `timeout` cannot kill or interrupt a tool call that is already running. It delivers at the next step.
 - **PTC.** Inside `run_code`, `concludeTurn` applies when the program ends, not at the `sleep` call.
-- **`pwsh`.** Not intercepted in this version.
-- **bash contract.** The synthetic result is validated at runtime. A schema change falls back to the shell instead of failing.
+- **`pwsh`.** Neither intercepted nor denied in this version.
+- **Scanner reach.** The gate reads the command text only. It does not open script files (`bash script.sh`, `source x`), resolve dynamic names (`$cmd 5`), or read other interpreters (`python3 -c 'time.sleep(5)'`). The denial and the prompt section forbid those workarounds; nothing enforces it.
+- **Other tools.** Only the `bash` tool is gated. A wait run through another tool, such as an MCP `ssh_exec`, is not seen.
+- **bash contract.** The synthetic result is validated at runtime. A schema change makes the wrapper step aside; with `denyShellWaits` the gate then denies the pure wait instead of running it in the shell.
 - **Token cost.** A wake is a model request. A sleep is not free.
 - **One maintenance per Agent.** Another plugin's maintenance can delay the keeper by one retry.
 - **No mediated permissions.** The plugin uses no fs, network, or storage.
@@ -290,6 +340,8 @@ The suite uses `node:test`, fake timers, and a fake Agent/context. It targets:
 - cancellation, disposal, and Agent isolation;
 - pending caps and invalid durations;
 - accepted interception and schema fallback to `next()`;
+- shell wait detection: command position, wrappers, substitutions, heredocs, nested and remote scripts, and data that must stay allowed;
+- the deny gate: denial text and identity, pass-through for pure waits, and the pending-cap failure;
 - `/sleep` list and cancel, scoped to one Agent.
 
 ## Files
@@ -298,8 +350,9 @@ The suite uses `node:test`, fake timers, and a fake Agent/context. It targets:
 |---|---|
 | `lib/index.js` | Plugin entry: config, tools, prompt, command, listeners, cleanup. |
 | `lib/store.js` | Per-Agent wait store and maintenance keepalive. |
-| `lib/intercept.js` | Fail-open `tools/execute` shell wrapper. |
+| `lib/intercept.js` | `tools/pre-execute` shell wait gate and fail-open `tools/execute` shell wrapper. |
 | `lib/parse.js` | Strict `sleep` and `timeout ... sleep` parsers. |
+| `lib/scan.js` | Shell-aware detection of `sleep` and `timeout` invocations. |
 | `lib/messages.js` | Wake, placeholder, and cancellation messages. |
 | `lib/config.js` | Config defaults, coercion, and hard limits. |
 | `cordis.patch.yml` | Bundle row with the seed config. |

@@ -29,6 +29,8 @@ test('coerces boolean strings', () => {
   assert.equal(normalizeConfig({ wakeOnInput: 'off' }).wakeOnInput, false);
   assert.equal(normalizeConfig({ wakeOnInput: 'on' }).wakeOnInput, true);
   assert.equal(normalizeConfig({ interceptShell: 'true' }).interceptShell, true);
+  assert.equal(normalizeConfig({ denyShellWaits: 'off' }).denyShellWaits, false);
+  assert.equal(normalizeConfig({}).denyShellWaits, true);
 });
 
 test('coerces numeric strings', () => {

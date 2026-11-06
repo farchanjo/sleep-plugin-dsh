@@ -39,21 +39,19 @@ This plugin gives waits a native timer and a lifecycle:
 
 ## Install
 
-```bash
-dsh plugin --profile dsh-tui add /root/dev/sleep-plugin-dsh
-dsh plugin --profile web add /root/dev/sleep-plugin-dsh
+Every tagged version ships a packed tarball on the
+[Releases](https://github.com/farchanjo/sleep-plugin-dsh/releases) page:
+
+```sh
+dsh plugin --profile <profile> add \
+  https://github.com/farchanjo/sleep-plugin-dsh/releases/download/v<version>/sleep-plugin-dsh-<version>.tgz
 ```
 
-Restart dsh after adding the row.
+Verify the asset against the `.sha256` published beside it before installing.
+Remove with `dsh plugin --profile <profile> remove sleep-plugin-dsh`.
 
-Remove with:
-
-```bash
-dsh plugin --profile dsh-tui remove sleep-plugin-dsh
-dsh plugin --profile web remove sleep-plugin-dsh
-```
-
-The package is a local bundle. The profile manifest and lockfile are the only configuration files the install changes.
+A git clone works too, for development. The release contract — bump, tag,
+assets, checks — lives in [AGENTS.md](AGENTS.md).
 
 ## Plugin-only contract
 
